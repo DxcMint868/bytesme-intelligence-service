@@ -13,6 +13,8 @@ sentence-transformers
 pandas
 tf-keras
 
+mlxtend
+
 # flask
 # faiss-cpu
 # sentence-transformers
