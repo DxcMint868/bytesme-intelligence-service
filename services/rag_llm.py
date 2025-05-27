@@ -1,6 +1,6 @@
 from singletons.logger import get_logger
 from singletons.db_conn import get_db_connection, release_db_connection
-from services.vectorstore import retrieve_docs
+from services.vectorstore import retrieve_docs_from_query
 from langchain.prompts import PromptTemplate
 import requests
 import json
@@ -27,7 +27,7 @@ def generate_with_llm(
     try:
         conn = get_db_connection()
         # Get documents and product details from vector search
-        retrieved_docs_with_distance, product_details_list = retrieve_docs(
+        retrieved_docs_with_distance, product_details_list = retrieve_docs_from_query(
             conn, query, top_k=5)
         # Stream document to front-end to simulate real thinking
         content = ""

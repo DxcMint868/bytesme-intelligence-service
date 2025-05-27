@@ -1,5 +1,5 @@
 from singletons.logger import get_logger
-from singletons.embedding_model import get_embedding_model
+from singletons.embedding_model import embed_text
 from singletons.db_conn import release_db_connection
 import json
 from langchain.embeddings import HuggingFaceEmbeddings
@@ -8,28 +8,11 @@ from langchain_core.documents import Document
 logger = get_logger()
 
 
-EMBEDDING_DIMENSIONS = 768
 COLLECTION_NAME = "product_pg_embeddings"
 SCHEMA_NAME = "public"
 
 
-def embed_text(text):
-    """Wrapper function to safely create embeddings"""
-    try:
-        model = get_embedding_model()
-        embeddings = model.encode(text, normalize_embeddings=True)
-        logger.info(
-            f"Generated embeddings for text: {text[:50]}... with shape {embeddings.shape}")
-        # Log first 5 values for debugging
-        logger.info(f"Embedding: {embeddings[:5]}...")
-        return embeddings.tolist()
-    except Exception as e:
-        print(f"Error embedding text: {e}")
-        # Return zeros array as fallback (with proper dimension)
-        return [0.0] * EMBEDDING_DIMENSIONS
-
-
-def retrieve_docs(conn, query, top_k=3, skip=0):
+def retrieve_docs_from_query(conn, query, top_k=3, skip=0):
     """Retrieve documents and product details using vector distance."""
     try:
         query_embedding = embed_text(query)
@@ -139,3 +122,129 @@ def retrieve_docs(conn, query, top_k=3, skip=0):
     except Exception as e:
         logger.error(f"Error in retrieve_docs: {e}", exc_info=True)
         return [], []
+
+
+def retrieve_docs_from_product_code(conn, product_code, top_k=5):
+    """Retrieve a single document by product code and find similar products."""
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SET search_path TO {SCHEMA_NAME}, public;")
+
+        # Get the document and metadata for the given product_code
+        sql_query = """
+		SELECT
+			e.document,
+			e.cmetadata
+		FROM
+			langchain_pg_collection c
+		JOIN
+			langchain_pg_embedding e ON c.id = e.collection_id
+		WHERE
+			c.name = %s AND e.cmetadata->>'product_code' = %s;
+		"""
+        logger.info(
+            f"Executing document retrieval for product_code: {product_code}")
+        cursor.execute(sql_query, (COLLECTION_NAME, product_code))
+
+        query_product_row = cursor.fetchone()
+        documents = []
+        if query_product_row:
+            document_text = query_product_row[0]
+            metadata_json = query_product_row[1]
+
+            # Parse metadata
+            if isinstance(metadata_json, dict):
+                metadata = metadata_json
+            elif metadata_json:
+                try:
+                    metadata = json.loads(metadata_json)
+                except json.JSONDecodeError:
+                    logger.error(
+                        f"Failed to parse metadata JSON: {metadata_json}")
+                    metadata = {}
+            else:
+                metadata = {}
+
+            embedding = embed_text(document_text)
+
+            # Find similar products (excluding itself)
+            similar_sql = """
+			SELECT
+				p.product_id,
+				p.product_name,
+				p.category_id,
+				p.product_unit_price,
+				p.product_discount_percentage,
+				pi.product_image_url,
+				e.document,
+				e.cmetadata
+			FROM
+				langchain_pg_collection c
+			JOIN
+				langchain_pg_embedding e ON c.id = e.collection_id
+			LEFT JOIN
+				products p ON p.product_code = e.cmetadata->>'product_code'
+            LEFT JOIN LATERAL
+                (SELECT product_image_url
+                FROM product_images
+                WHERE product_images.product_id = p.product_id
+                LIMIT 1) pi ON TRUE
+			WHERE
+				c.name = %s
+				AND e.cmetadata->>'product_code' != %s
+				AND (p.product_stock_quantity > 0 OR p.product_stock_quantity IS NULL)
+			ORDER BY
+				e.embedding <=> %s::vector ASC
+			LIMIT %s
+			"""
+            cursor.execute(similar_sql, (COLLECTION_NAME,
+                           product_code, embedding, top_k))
+
+            related_product_rows = cursor.fetchall()
+            related_product_details = []
+            for row in related_product_rows:
+                # Parse sizes and prices
+                sizes_prices_obj = row[3]
+                sizes, prices = parse_product_sizes_prices(sizes_prices_obj)
+                related_product_details.append({
+                    "product_id": row[0],
+                    "product_name": row[1],
+                    "category_id": row[2],
+                    "sizes": sizes,
+                    "prices": prices,
+                    "discount_percentage": row[4],
+                    "image_url": row[5],
+                })
+                # Create langchain document
+                documents.append(Document(
+                    page_content=row[6], metadata=row[7]))
+
+            cursor.close()
+            return documents, related_product_details
+
+        else:
+            logger.warning(
+                f"No document found for product_code: {product_code}")
+            cursor.close()
+            return None
+    except Exception as e:
+        logger.error(
+            f"Error in retrieve_docs_from_product_code: {e}", exc_info=True)
+        return None
+
+
+# Util function (de day tam)
+def parse_product_sizes_prices(sizes_prices_dict):
+    """Parse sizes and prices from a JSON object."""
+    if not sizes_prices_dict:
+        return {"sizes": [], "product_prices": []}
+
+    try:
+        sizes = sizes_prices_dict.get("product_sizes", "").split("|")
+        prices = sizes_prices_dict.get("product_prices", "")
+        prices = list(map(int, str(prices).split("|")))
+        logger.debug("Parsed sizes: %s, prices: %s", sizes, prices)
+        return sizes, prices
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse sizes and prices: {e}")
+        return {"product_sizes": [], "product_prices": []}
