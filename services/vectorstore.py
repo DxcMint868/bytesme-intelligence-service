@@ -220,6 +220,8 @@ def retrieve_docs_from_product_code(conn, product_code, top_k=5):
                     page_content=row[6], metadata=row[7]))
 
             cursor.close()
+            logger.debug("Retrieved product details: %s",
+                         related_product_details)
             return documents, related_product_details
 
         else:
