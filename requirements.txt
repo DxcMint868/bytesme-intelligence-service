@@ -1,0 +1,18 @@
+langchain
+# langchain-core==0.1.52
+# langchain-community==0.0.38
+# langchain-experimental==0.0.58
+
+pgvector
+flask
+psycopg2-binary
+langchain-openrouter
+sseclient
+requests
+sentence-transformers
+pandas
+tf-keras
+
+# flask
+# faiss-cpu
+# sentence-transformers

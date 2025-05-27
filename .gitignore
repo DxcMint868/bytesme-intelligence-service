@@ -1,0 +1,6 @@
+Related_Products/venv/
+Recommendation_Products/venv/
+venv/
+.env
+
+__pycache__/
