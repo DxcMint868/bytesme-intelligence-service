@@ -12,11 +12,15 @@ _gen_model = None
 # Flag to avoid retrying a persistently failing model too often
 _primary_model_init_failed = False
 
-GENERATIVE_MODEL_TEMPERATURE = 0.5
+GENERATIVE_MODEL_TEMPERATURE = 0.85
+
+# OPENROUTER_MODELS = [
+# 	''
+# ]
 
 
 def get_openrouter_model_name():
-    return "mistralai/mistral-7b-instruct:free"  # Example
+    return "meta-llama/llama-4-maverick:free"
 
 
 # Add excepted_keys if you use it

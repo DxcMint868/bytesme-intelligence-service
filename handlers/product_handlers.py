@@ -5,42 +5,60 @@ from singletons.logger import get_logger
 from services.rag_llm import generate_with_llm
 from services.vectorstore import retrieve_docs_from_query, retrieve_docs_from_product_code
 import sqlite3
+
+
 from collections import defaultdict
 
 logger = get_logger()
 
-
 def handle_search_rag():
     query = request.args.get('query')
-    if not query:
-        return Response(json.dumps({"message": "Query parameter is missing"}), status=400, mimetype='application/json')
+    session_id = request.args.get(
+        'session_id') or request.headers.get('X-Session-ID')
+    language_slug = request.args.get('language-slug', 'vi')
+    logger.info(f"🔥 Received query: {query}, session_id: {session_id}")
 
-    # Prepared injection dependencies
-    gen_model = get_gen_model()
+    if not query:
+        return Response(json.dumps({"message": "Query parameter is missing"}),
+                        status=400, mimetype='application/json')
+
+    if not session_id:
+        # Generate a session ID if not provided
+        import uuid
+        session_id = str(uuid.uuid4())
+        logger.info(f"Generated new session ID: {session_id}")
+
+    try:
+        gen_model = get_gen_model()
+    except Exception as e:
+        logger.error(f"Failed to get generative model: {e}")
+        return Response(json.dumps({"message": "LLM service unavailable"}),
+                        status=503, mimetype='application/json')
 
     def on_rate_limit(e):
         logger.warning(f"Rate limit exceeded: {e}")
-        fallback_gen_model = get_fallback_gen_model()
-        # Try again with fallback model
-        generate_with_llm(query, fallback_gen_model)
+        # Handle fallback logic
 
     def on_unauthorized(e):
         logger.error(f"Unauthorized access: {e}")
-        return Response(json.dumps({"message": "Unauthorized access"}), status=401, mimetype='application/json')
 
     def on_generic_error(e):
-        logger.error(f"Generic error occurred: {e}")
-        return Response(json.dumps({"message": "An error occurred"}), status=500, mimetype='application/json')
+        logger.error(f"Generic error: {e}")
 
-    return Response(
+    # Set session ID in response headers
+    response = Response(
         generate_with_llm(
             query,
             gen_model,
+            session_id,
             on_rate_limit=on_rate_limit,
             on_unauthorized=on_unauthorized,
             on_generic_error=on_generic_error
         ),
-        mimetype='text/event-stream')
+        mimetype='text/event-stream'
+    )
+    response.headers['X-Session-ID'] = session_id
+    return response
 
 
 def handle_search_semantics():
