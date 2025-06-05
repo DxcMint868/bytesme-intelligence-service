@@ -1,11 +1,11 @@
 from singletons.logger import get_logger
-from singletons.embedding_model import embed_text
 from singletons.db_conn import get_db_connection, release_db_connection
 from singletons.session_manager import get_session_manager
 from services.vectorstore import retrieve_docs_from_query
 from langchain.prompts import PromptTemplate
 import requests
 import json
+from singletons.query_classifier import get_query_classifier
 
 logger = get_logger()
 
@@ -35,85 +35,45 @@ Answer:
 """
 
 
-# def generate_with_llm(
-#         query,
-#         llm,
-#         on_rate_limit=None,
-#         on_unauthorized=None,
-#         on_generic_error=None
-# ):
-#     try:
-#         conn = get_db_connection()
-#         # Get documents and product details from vector search
-#         retrieved_docs_with_distance, product_details_list = retrieve_docs_from_query(
-#             conn, query, top_k=5)
-#         # Stream document to front-end to simulate real thinking
-#         content = ""
-#         for idx, (doc, distance) in enumerate(retrieved_docs_with_distance):
-#             content = doc.page_content[:200] + "..." if len(
-#                 doc.page_content) > 200 else doc.page_content
-#             content += "Đánh giá mức độ trùng khớp so với tìm kiếm người dùng: " + \
-#                 str(round(1 - distance, 4)) + "\n\n"
-#         yield f"data: {json.dumps({'type': 'thinking', 'chunk': content})}\n\n"
-#         # Prepare context for LLM
-#         if retrieved_docs_with_distance:
-#             context_parts = [doc.page_content for doc,
-#                              dist in retrieved_docs_with_distance]
-#             context_str = "\n\n---\n\n".join(context_parts)
-#             logger.info(
-#                 f"Context for LLM (first 300 chars): {context_str[:300]}...")
-#         else:
-#             context_str = "No specific product information was found related to your query."
-#             logger.info(
-#                 "No documents found by vector search to form context.")
+PRODUCT_FOCUSED_PROMPT = """
+You are an AI assistant for Bytesme F&B app, which sells products such as cake, pastries, cookies, desserts, and drinks.
+You are having a conversation with a customer about our products.
 
-#         # Format prompt
-#         prompt = PromptTemplate(template=CONVERSATIONAL_PROMPT_TEMPLATE,
-#                                 input_variables=["context", "question"])
-#         full_prompt_text = prompt.format(
-#             context=context_str, question=query)
-#         logger.info(
-#             f"Full prompt for LLM (first 300 chars): {full_prompt_text[:300]}...")
-#         # Stream AI response
-#         llmOutput = ''
-#         for chunk in llm.stream(full_prompt_text):
-#             if isinstance(chunk, str):
-#                 text = chunk
-#                 llmOutput += text
-#             elif hasattr(chunk, "content"):
-#                 text = chunk.content
-#                 llmOutput += text
-#             else:
-#                 text = str(chunk)
-#                 llmOutput += text
-#             yield f"data: {json.dumps({'type': 'answer', 'chunk': text})}\n\n"
-#         # Stream product details
-#         for product in product_details_list:
-#             yield f"data: {json.dumps({'type': 'product', 'data': product})}\n\n"
-#         # Signal end of stream
-#         yield "data: [DONE]\n\n"
-#         logger.info("All streaming finished successfully")
-#         logger.info("LLM streaming finished successfully")
-#         logger.info(f"Full LLM output: {llmOutput}...")
-#     except requests.exceptions.HTTPError as e:
-#         status_code = e.response.status_code
-#         logger.error(
-#             f"HTTP error during streaming query: {e}, Status Code: {status_code}", exc_info=True)
-#         if status_code == 429:
-#             if on_rate_limit:
-#                 on_rate_limit(e)
-#         elif status_code == 401:
-#             if on_unauthorized:
-#                 on_unauthorized(e)
-#         elif status_code == 500:
-#             if on_generic_error:
-#                 on_generic_error(e)
-#         # yield f"data: {json.dumps({'type': 'answer', 'chunk': error_message, 'error': True})}\n\n"
-#         yield "data: [DONE]\n\n"
+Conversation History:
+{conversation_history}
 
-#     finally:
-#         if conn:
-#             release_db_connection(conn)
+User's questions context:
+{context}
+
+Current User Question: {question}
+
+Instructions:
+- Respond in the same language as the current user query,
+- Respond in a fiendly, cute, teeny, heart-warming, playful tone
+- Focus on helping the customer with product information
+- Be friendly and helpful about our food and beverage offerings
+- Provide specific details about products when available
+
+Answer:
+"""
+
+GENERAL_CONVERSATION_PROMPT = """
+You are an AI assistant for Bytesme F&B app. You are having a friendly conversation with a customer.
+
+Conversation History:
+{conversation_history}
+
+Current User Question: {question}
+
+Instructions:
+- Respond in the same language as the current user query,
+- Respond in a fiendly, cute, teeny, heart-warming, playful tone
+- Be friendly, helpful, and conversational
+- You can discuss general topics, store information, policies, etc.
+- If the customer asks about products, you can mention that you'd be happy to help them find specific items
+
+Answer:
+"""
 
 
 def generate_with_llm(
@@ -126,66 +86,104 @@ def generate_with_llm(
 ):
     session_manager = get_session_manager()
     session = session_manager.get_or_create_session(session_id)
+    query_classifier = get_query_classifier()
 
     try:
         conn = get_db_connection()
 
         # Add user message to conversation history
         session.add_message("user", query)
-
-        # Get conversation history
         conversation_history = session.get_conversation_history()
 
-        # Enhanced query for vector search - combine current query with recent context
-        enhanced_query = query
-        if len(session.messages) > 1:
-            # If there's conversation history, enhance the search query
-            recent_queries_context = " ".join(
-                [msg.content for msg in session.messages[-1:] if msg.role == "user"])
-            enhanced_query = f"{recent_queries_context} {query}"
+        # STEP 1: Classify the query
+        classification = query_classifier.classify_query(query)
+
+        # Send classification info to client
+        yield f"data: {json.dumps({'type': 'thinking', 'chunk': classification})}\n\n"
+
+        if classification['is_product_related']:
+            # STEP 2A: Product-related query - perform RAG
             logger.info(
-                f"Enhanced query for vector search: {enhanced_query}...")
+                f"Product-related query detected: {classification['reasoning']}")
 
-        # Get documents and product details from vector search
-        retrieved_docs_with_distance, product_details_list = retrieve_docs_from_query(
-            conn, enhanced_query, top_k=4)
+            # Enhanced query for vector search
+            enhanced_query = query
+            if len(session.messages) > 1:
+                recent_queries_context = " ".join(
+                    [msg.content for msg in session.messages[:-1] if msg.role == "user"])
+                enhanced_query = f"{recent_queries_context} {query}"
+                logger.info(
+                    f"Enhanced query for vector search: {enhanced_query}...")
 
-        # Update session context
-        session.update_context_documents(retrieved_docs_with_distance)
+            # Get documents and product details from vector search
+            retrieved_docs_with_distance, product_details_list = retrieve_docs_from_query(
+                conn, enhanced_query, top_k=4)
 
-        # Stream thinking content
-        content = ""
-        for idx, (doc, distance) in enumerate(retrieved_docs_with_distance):
-            content = doc.page_content[:200] + "..." if len(
-                doc.page_content) > 200 else doc.page_content
-            content += f"Đánh giá mức độ trùng khớp: {round(1 - distance, 4)}\n\n"
-        yield f"data: {json.dumps({'type': 'thinking', 'chunk': content})}\n\n"
+            # Update session context
+            session.update_context_documents(retrieved_docs_with_distance)
 
-        # Prepare context for LLM
-        if retrieved_docs_with_distance:
-            context_parts = [doc.page_content for doc,
-                             dist in retrieved_docs_with_distance]
-            context_str = "\n\n".join(context_parts)
+            # Stream thinking content
+            thinking_content = f"🔍 Đang tìm kiếm sản phẩm liên quan...\n"
+            thinking_content += f"📊 Độ tin cậy phân loại: {classification['confidence']:.2f}\n\n"
+
+            for idx, (doc, distance) in enumerate(retrieved_docs_with_distance):
+                content = doc.page_content[:200] + "..." if len(
+                    doc.page_content) > 200 else doc.page_content
+                thinking_content += f"📄 Tài liệu {idx + 1}: {content}\n"
+                thinking_content += f"🎯 Độ trùng khớp: {round(1 - distance, 4)}\n\n"
+
+            yield f"data: {json.dumps({'type': 'thinking', 'chunk': thinking_content})}\n\n"
+
+            # Prepare context for LLM
+            if retrieved_docs_with_distance:
+                context_parts = [doc.page_content for doc,
+                                 dist in retrieved_docs_with_distance]
+                context_str = "\n\n".join(context_parts)
+            else:
+                context_str = "Không tìm thấy thông tin sản phẩm cụ thể."
+
+            # Use product-focused prompt
+            prompt = PromptTemplate(
+                template=PRODUCT_FOCUSED_PROMPT,
+                input_variables=["conversation_history", "context", "question"]
+            )
+            full_prompt_text = prompt.format(
+                conversation_history=conversation_history,
+                context=context_str,
+                question=query
+            )
+
         else:
-            context_str = "No specific product information found."
+            # STEP 2B: General conversation - skip RAG
+            logger.info(
+                f"General conversation detected: {classification['reasoning']}")
 
-        # Format prompt with conversation history
-        prompt = PromptTemplate(
-            template=CONVERSATIONAL_PROMPT_TEMPLATE,
-            input_variables=["conversation_history", "context", "question"]
-        )
-        full_prompt_text = prompt.format(
-            conversation_history=conversation_history,
-            context=context_str,
-            question=query,
-        )
-        print(
-            f"Debug: session_id: {session_id}, convo history: {conversation_history}")
+            # Stream thinking content for general conversation
+            thinking_content = f"💬 Câu hỏi chung - không cần tìm kiếm sản phẩm\n"
+            thinking_content += f"📊 Độ tin cậy phân loại: {classification['confidence']:.2f}\n"
+            thinking_content += f"🤖 Sử dụng AI thuần túy để trả lời\n\n"
+
+            yield f"data: {json.dumps({'type': 'thinking', 'chunk': thinking_content})}\n\n"
+
+            # Use general conversation prompt (no product context)
+            prompt = PromptTemplate(
+                template=GENERAL_CONVERSATION_PROMPT,
+                input_variables=["conversation_history", "question"]
+            )
+            full_prompt_text = prompt.format(
+                conversation_history=conversation_history,
+                question=query
+            )
+
+            # No product details for general conversation
+            product_details_list = []
 
         logger.info(
-            f"Conversational prompt (first 300 chars): {full_prompt_text[:300]}...")
+            f"Prompt type: {'Product-focused' if classification['is_product_related'] else 'General conversation'}")
+        logger.info(
+            f"Full prompt (first 300 chars): {full_prompt_text[:300]}...")
 
-        # Stream AI response
+        # STEP 3: Stream LLM response
         llm_output = ''
         for chunk in llm.stream(full_prompt_text):
             if isinstance(chunk, str):
@@ -201,31 +199,18 @@ def generate_with_llm(
         # Add assistant response to conversation history
         session.add_message("assistant", llm_output)
 
-        # Stream product details
-        for product in product_details_list:
-            yield f"data: {json.dumps({'type': 'product', 'data': product})}\n\n"
+        # STEP 4: Stream product details (only for product-related queries)
+        if classification['is_product_related'] and product_details_list:
+            for product in product_details_list:
+                yield f"data: {json.dumps({'type': 'product', 'data': product})}\n\n"
 
-        # Send session ID before end of stream
-        yield f"data: {json.dumps({'type': 'session_id', 'session_id': session_id})}\n\n"
+        # Send session ID and classification summary
+        yield f"data: {json.dumps({'type': 'session_id', 'session_id': session_id, 'query_type': classification['category']})}\n\n"
 
         # Signal end of stream
         yield "data: [DONE]\n\n"
         logger.info(
-            f"Conversational response completed for session: {session_id}")
-
-    except requests.exceptions.HTTPError as e:
-        status_code = e.response.status_code
-        logger.error(
-            f"HTTP error during streaming: {e}, Status: {status_code}")
-
-        if status_code == 429 and on_rate_limit:
-            on_rate_limit(e)
-        elif status_code == 401 and on_unauthorized:
-            on_unauthorized(e)
-        elif on_generic_error:
-            on_generic_error(e)
-
-        yield "data: [DONE]\n\n"
+            f"Response completed for session: {session_id} (type: {classification['category']})")
 
     except Exception as e:
         logger.error(f"Error in conversational LLM: {e}", exc_info=True)
